@@ -1,0 +1,11 @@
+# Claude Code 개인 설정 (자동 추가)
+.claude/settings.local.json
+
+# Word 임시 파일 제외
+~$*.docx
+
+# Node.js 패키지 폴더 제외
+node_modules/
+
+# Python 캐시 제외
+__pycache__/

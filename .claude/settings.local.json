@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(pandoc --version)",
+      "Bash(python -c \"import sys; data=sys.stdin.buffer.read\\(\\); print\\(data.decode\\('utf-8', errors='replace'\\)\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('xyzdraw_main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('문법 OK'\\)\")",
+      "Bash(del \"D:\\\\17_my_project\\\\xyzdraw\\\\docx_content.txt\")",
+      "WebFetch(domain:wiki.freecad.org)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('xyzdraw_main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}
