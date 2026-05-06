@@ -66,12 +66,13 @@ def find_freecad_executables(custom_dir=None):
 # ── FreeCAD 스크립트 생성 ─────────────────────────────────────────────────────
 
 # Hexagon helper — FreeCAD 스크립트 헤더에 삽입
+# 30° 회전(math.pi/6 오프셋): 꼭짓점이 아닌 면(flat side)이 X 방향으로 접속됨
 _HEXAGON_HELPER = """\
 import math
 
 def _make_hexagon(r, h, px=0, py=0, pz=0):
-    pts = [App.Vector(px + r * math.cos(math.pi / 3 * i),
-                      py + r * math.sin(math.pi / 3 * i), pz)
+    pts = [App.Vector(px + r * math.cos(math.pi / 3 * i + math.pi / 6),
+                      py + r * math.sin(math.pi / 3 * i + math.pi / 6), pz)
            for i in range(6)]
     pts.append(pts[0])
     wire = Part.makePolygon(pts)
@@ -99,21 +100,26 @@ def _make_shape_call(shape_type, params, px, py, pz):
 
 
 def _shape_x_extent(shape_type, params):
-    """X 방향 전체 크기 (간격 스텝 계산용)."""
+    """X 방향 전체 크기 (간격 스텝 계산용).
+    Hexagon(30°회전): flat-to-flat 폭 = r*√3 (면 접속 기준)."""
     if shape_type == "Box":      return params["length"]
     if shape_type == "Cylinder": return 2.0 * params["radius"]
     if shape_type == "Cone":     return 2.0 * max(params["radius1"], params["radius2"])
     if shape_type == "Sphere":   return 2.0 * params["radius"]
-    if shape_type == "Hexagon":  return 2.0 * params["radius"]
+    if shape_type == "Hexagon":  return params["radius"] * (3 ** 0.5)  # flat-to-flat
 
 
-def _shape_y_extent(shape_type, params):
-    """Y 방향 전체 크기 (Y축 격자 스텝 계산용)."""
+def _shape_y_extent(shape_type, params, triangular=False):
+    """Y 방향 전체 크기 (Y축 격자 스텝 계산용).
+    Hexagon 삼각 배열: 행간 중심 거리 = r*1.5 (면 접속 기준)."""
     if shape_type == "Box":      return params["width"]
     if shape_type == "Cylinder": return 2.0 * params["radius"]
     if shape_type == "Cone":     return 2.0 * max(params["radius1"], params["radius2"])
     if shape_type == "Sphere":   return 2.0 * params["radius"]
-    if shape_type == "Hexagon":  return params["radius"] * (3 ** 0.5)  # flat-top 세로 길이
+    if shape_type == "Hexagon":
+        # 삼각 배열: 행간 중심 거리 = r*1.5 (honeycomb 면 접속)
+        # 일반 배열: vertex-to-vertex 높이 = 2*r
+        return params["radius"] * 1.5 if triangular else 2.0 * params["radius"]
 
 
 def _shape_center_offset(shape_type, params):
@@ -134,10 +140,14 @@ def _inner_xy_position(inner_type, inner_params, cx, cy):
 
 
 def make_freecad_script(outer_type, outer_params, count_x, count_y, spacing,
-                         inner_type, inner_params,
+                         triangular, inner_type, inner_params,
                          out_fcstd, out_step, out_stl):
+    """
+    triangular=True: 행 j 마다 X 개수를 1씩 줄이고 X 방향으로 step_x/2 씩 오프셋.
+    Hexagon 삼각 배열 시 step_y = r*1.5 (면 접속 기준).
+    """
     step_x = _shape_x_extent(outer_type, outer_params) + spacing
-    step_y = _shape_y_extent(outer_type, outer_params) + spacing
+    step_y = _shape_y_extent(outer_type, outer_params, triangular) + spacing
     has_inner = inner_type is not None
     needs_hexagon = (outer_type == "Hexagon" or inner_type == "Hexagon")
 
@@ -153,9 +163,18 @@ def make_freecad_script(outer_type, outer_params, count_x, count_y, spacing,
 
     idx = 0
     for j in range(count_y):
+        if triangular:
+            row_count = count_x - j  # 행마다 1개씩 감소
+            if row_count <= 0:
+                break
+            x_offset = j * step_x / 2  # 반 스텝씩 오프셋 → 삼각 접속
+        else:
+            row_count = count_x
+            x_offset = 0.0
+
         py = j * step_y
-        for i in range(count_x):
-            px = i * step_x
+        for i in range(row_count):
+            px = x_offset + i * step_x
             lines.append(f"# outer shape (x={i+1}, y={j+1})")
             lines.append(f"s{idx} = {_make_shape_call(outer_type, outer_params, px, py, 0)}")
             lines.append(f"all_shapes.append(s{idx})")
@@ -262,7 +281,7 @@ def on_inner_shape_changed(event=None):
 
 def on_inner_toggle():
     if var_inner.get():
-        inner_frame.grid(row=9, column=0, columnspan=3,
+        inner_frame.grid(row=10, column=0, columnspan=3,
                          padx=10, pady=4, sticky="ew")
         on_inner_shape_changed()
     else:
@@ -342,7 +361,7 @@ def generate_model():
         messagebox.showerror("입력 오류", f"파라미터 값을 확인해주세요.\n{e}")
         return
 
-    # ── X·Y 개수 / 간격 ──
+    # ── X·Y 개수 / 간격 / 삼각 배열 ──
     try:
         count_x = int(spin_count_x.get())
         count_y = int(spin_count_y.get())
@@ -355,6 +374,8 @@ def generate_model():
     except ValueError as e:
         messagebox.showerror("입력 오류", f"개수/간격 값을 확인해주세요.\n{e}")
         return
+
+    triangular = var_triangular.get()
 
     # ── 내부 도형 파라미터 ──
     try:
@@ -394,7 +415,7 @@ def generate_model():
     script_path = os.path.join(out_dir, "_freecad_run.py")
     script_content = make_freecad_script(
         shape, outer_params, count_x, count_y, spacing,
-        inner_type, inner_params,
+        triangular, inner_type, inner_params,
         out_fcstd, out_step, out_stl,
     )
     try:
@@ -404,8 +425,12 @@ def generate_model():
         messagebox.showerror("파일 오류", f"스크립트 파일을 생성할 수 없습니다.\n{e}")
         return
 
-    total = count_x * count_y
-    grid_desc = (f" X{count_x}×Y{count_y}={total}개" if total > 1 else "")
+    if triangular:
+        total = sum(max(0, count_x - j) for j in range(count_y))
+        grid_desc = f" 삼각({count_x}→…)×Y{count_y}={total}개" if total > 1 else ""
+    else:
+        total = count_x * count_y
+        grid_desc = f" X{count_x}×Y{count_y}={total}개" if total > 1 else ""
     inner_desc = f"  / 내부: {inner_type}" if inner_type else ""
     full_desc  = f"{desc}{grid_desc}{inner_desc}"
 
@@ -525,10 +550,19 @@ spin_count_y.pack(side="left", padx=(2, 8))
 tk.Label(count_frame, text="(최대 각 20개)",
          fg="gray", font=("Arial", 9)).pack(side="left")
 
+# ── 삼각형 배열 ──
+var_triangular = tk.BooleanVar(value=False)
+tk.Checkbutton(
+    root,
+    text="삼각형 배열  (Y행마다 X개수 1씩 감소 + 반 스텝 오프셋 / X1 < X0 시 자동 접속)",
+    variable=var_triangular,
+    font=("Arial", 9),
+).grid(row=6, column=0, columnspan=3, sticky="w", padx=12, pady=1)
+
 # ── 도형 간격 ──
-tk.Label(root, text="도형 간격").grid(row=6, column=0, sticky="e", **PAD)
+tk.Label(root, text="도형 간격").grid(row=7, column=0, sticky="e", **PAD)
 spacing_frame = tk.Frame(root)
-spacing_frame.grid(row=6, column=1, columnspan=2, sticky="w")
+spacing_frame.grid(row=7, column=1, columnspan=2, sticky="w")
 entry_spacing = tk.Entry(spacing_frame, width=10)
 entry_spacing.insert(0, "0")
 entry_spacing.pack(side="left")
@@ -539,7 +573,7 @@ tk.Label(spacing_frame, text="(X·Y 방향 동일 적용)",
          fg="gray", font=("Arial", 9)).pack(side="left")
 
 ttk.Separator(root, orient="horizontal").grid(
-    row=7, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
+    row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
 
 # ── 내부 도형 ──
 var_inner = tk.BooleanVar(value=False)
@@ -549,9 +583,9 @@ tk.Checkbutton(
     variable=var_inner,
     command=on_inner_toggle,
     font=("Arial", 10),
-).grid(row=8, column=0, columnspan=3, sticky="w", padx=12, pady=2)
+).grid(row=9, column=0, columnspan=3, sticky="w", padx=12, pady=2)
 
-# inner_frame — on_inner_toggle 에 의해 row=9 에 표시/숨김
+# inner_frame — on_inner_toggle 에 의해 row=10 에 표시/숨김
 inner_frame = tk.LabelFrame(root, text="내부 도형 설정", padx=6, pady=4)
 
 tk.Label(inner_frame, text="도형 종류", width=12, anchor="e").grid(
@@ -569,12 +603,12 @@ lbl_ip2, entry_ip2, combo_iu2 = make_param_row(inner_param_frame, 1, "높이 (h)
 lbl_ip3, entry_ip3, combo_iu3 = make_param_row(inner_param_frame, 2, "z (높이)")
 
 ttk.Separator(root, orient="horizontal").grid(
-    row=10, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
+    row=11, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
 
 # ── 저장 형식 ──
-tk.Label(root, text="저장 형식").grid(row=11, column=0, sticky="e", **PAD)
+tk.Label(root, text="저장 형식").grid(row=12, column=0, sticky="e", **PAD)
 fmt_frame = tk.Frame(root)
-fmt_frame.grid(row=11, column=1, columnspan=2, sticky="w")
+fmt_frame.grid(row=12, column=1, columnspan=2, sticky="w")
 var_fcstd = tk.BooleanVar(value=True)
 var_step  = tk.BooleanVar(value=True)
 var_stl   = tk.BooleanVar(value=True)
@@ -583,24 +617,24 @@ tk.Checkbutton(fmt_frame, text="STEP",  variable=var_step).pack(side="left", pad
 tk.Checkbutton(fmt_frame, text="STL",   variable=var_stl).pack(side="left", padx=4)
 
 # ── 출력 폴더 ──
-tk.Label(root, text="출력 폴더").grid(row=12, column=0, sticky="e", **PAD)
+tk.Label(root, text="출력 폴더").grid(row=13, column=0, sticky="e", **PAD)
 entry_output_dir = tk.Entry(root, width=30)
-entry_output_dir.grid(row=12, column=1, sticky="ew", **PAD)
+entry_output_dir.grid(row=13, column=1, sticky="ew", **PAD)
 entry_output_dir.insert(0, os.path.join(os.path.expanduser("~"), "Documents"))
 tk.Button(root, text="찾아보기", command=browse_output_folder, width=10).grid(
-    row=12, column=2, **PAD)
+    row=13, column=2, **PAD)
 
 ttk.Separator(root, orient="horizontal").grid(
-    row=13, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
+    row=14, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
 
 # ── FreeCAD 설치 폴더 ──
-tk.Label(root, text="FreeCAD\n실행 폴더").grid(row=14, column=0, sticky="e", **PAD)
+tk.Label(root, text="FreeCAD\n실행 폴더").grid(row=15, column=0, sticky="e", **PAD)
 entry_freecad_dir = tk.Entry(root, width=30)
-entry_freecad_dir.grid(row=14, column=1, sticky="ew", **PAD)
+entry_freecad_dir.grid(row=15, column=1, sticky="ew", **PAD)
 tk.Button(root, text="찾아보기", command=browse_freecad_folder, width=10).grid(
-    row=14, column=2, **PAD)
+    row=15, column=2, **PAD)
 tk.Label(root, text="※ 비워두면 자동 탐색 (Program Files 등)",
-         font=("Arial", 8), fg="gray").grid(row=15, column=0, columnspan=3)
+         font=("Arial", 8), fg="gray").grid(row=16, column=0, columnspan=3)
 
 # ── 생성 버튼 ──
 tk.Button(
@@ -613,12 +647,12 @@ tk.Button(
     font=("Arial", 11, "bold"),
     relief="raised",
     cursor="hand2",
-).grid(row=16, column=0, columnspan=3, pady=14)
+).grid(row=17, column=0, columnspan=3, pady=14)
 
 # ── 결과 표시 ──
 result_label = tk.Label(root, text="", justify="left", fg="#1565C0",
                          font=("Arial", 9), wraplength=560)
-result_label.grid(row=17, column=0, columnspan=3, padx=10, pady=4)
+result_label.grid(row=18, column=0, columnspan=3, padx=10, pady=4)
 
 # 초기 파라미터 표시
 on_shape_changed()
