@@ -2,12 +2,12 @@
 3D 도면 자동 생성 프로그램
 - FreeCAD Scripting Basics (wiki.freecad.org) 기반
 - Part 모듈로 실제 형상 생성 후 FCStd / STEP / STL 저장
+- 다중 생성 / 간격 / 내부 도형 지원
 """
 
 import os
 import sys
 import shutil
-import tempfile
 import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -61,72 +61,107 @@ def find_freecad_executables(custom_dir=None):
     return gui, cmd
 
 
-# ── FreeCAD 스크립트 생성 ────────────────────────────────────────────────────
-# wiki.freecad.org/FreeCAD_Scripting_Basics 기반:
-#   GUI 모드  : FreeCAD.exe 로 실행 → ViewProvider 포함 생성 → 3D 뷰 표시
-#   헤드리스  : FreeCADCmd.exe 로 실행 → 파일 저장만 (GUI 없음)
+# ── FreeCAD 스크립트 생성 ─────────────────────────────────────────────────────
 
-def _shape_code_and_label(shape_type, params):
+def _make_shape_call(shape_type, params, px, py, pz):
+    """Part.make* 호출 문자열 생성 (위치 포함)."""
+    pos = f"App.Vector({px:.6g}, {py:.6g}, {pz:.6g})"
     if shape_type == "Box":
-        code = (f"shape = Part.makeBox("
-                f"{params['length']}, {params['width']}, {params['height']})")
-        return code, "Box"
+        return (f"Part.makeBox({params['length']:.6g}, {params['width']:.6g}, "
+                f"{params['height']:.6g}, {pos})")
     if shape_type == "Cylinder":
-        code = f"shape = Part.makeCylinder({params['radius']}, {params['height']})"
-        return code, "Cylinder"
+        return f"Part.makeCylinder({params['radius']:.6g}, {params['height']:.6g}, {pos})"
     if shape_type == "Cone":
-        code = (f"shape = Part.makeCone("
-                f"{params['radius1']}, {params['radius2']}, {params['height']})")
-        return code, "Cone"
+        return (f"Part.makeCone({params['radius1']:.6g}, {params['radius2']:.6g}, "
+                f"{params['height']:.6g}, {pos})")
     if shape_type == "Sphere":
-        code = f"shape = Part.makeSphere({params['radius']})"
-        return code, "Sphere"
+        return f"Part.makeSphere({params['radius']:.6g}, {pos})"
     raise ValueError(f"Unknown shape type: {shape_type}")
 
 
-def make_freecad_script(shape_type, params, out_fcstd, out_step, out_stl):
-    """
-    GUI 모드(FreeCAD.exe)와 헤드리스(FreeCADCmd.exe) 모두에서 동작.
-    GUI 모드에서는 FreeCADGui를 통해 ViewProvider를 생성하고 3D 뷰를 맞춤.
-    """
-    shape_code, label = _shape_code_and_label(shape_type, params)
+def _shape_x_extent(shape_type, params):
+    """X 방향 전체 크기 (간격 계산용)."""
+    if shape_type == "Box":      return params["length"]
+    if shape_type == "Cylinder": return 2.0 * params["radius"]
+    if shape_type == "Cone":     return 2.0 * max(params["radius1"], params["radius2"])
+    if shape_type == "Sphere":   return 2.0 * params["radius"]
 
-    save_lines = []
+
+def _shape_center_offset(shape_type, params):
+    """도형 위치 벡터 기준 기하학적 중심 오프셋 (cx, cy, cz)."""
+    if shape_type == "Box":
+        return params["length"] / 2, params["width"] / 2, params["height"] / 2
+    if shape_type in ("Cylinder", "Cone"):
+        return 0.0, 0.0, params["height"] / 2
+    if shape_type == "Sphere":
+        return 0.0, 0.0, 0.0
+
+
+def _inner_position(inner_type, inner_params, cx, cy, cz):
+    """내부 도형의 중심이 (cx, cy, cz)가 되도록 하는 위치 벡터."""
+    if inner_type == "Box":
+        l, w, h = inner_params["length"], inner_params["width"], inner_params["height"]
+        return cx - l / 2, cy - w / 2, cz - h / 2
+    if inner_type in ("Cylinder", "Cone"):
+        return cx, cy, cz - inner_params["height"] / 2
+    if inner_type == "Sphere":
+        return cx, cy, cz
+
+
+def make_freecad_script(outer_type, outer_params, count, spacing,
+                         inner_type, inner_params,
+                         out_fcstd, out_step, out_stl):
+    step_x = _shape_x_extent(outer_type, outer_params) + spacing
+    has_inner = inner_type is not None
+
+    lines = [
+        "import FreeCAD as App",
+        "import Part",
+        "",
+        'doc = App.newDocument("GeneratedModel")',
+        "all_shapes = []",
+        "",
+    ]
+
+    for i in range(count):
+        px = i * step_x
+        lines.append(f"# outer shape {i + 1}")
+        lines.append(f"s{i} = {_make_shape_call(outer_type, outer_params, px, 0, 0)}")
+        lines.append(f"all_shapes.append(s{i})")
+        if has_inner:
+            ocx, ocy, ocz = _shape_center_offset(outer_type, outer_params)
+            ipx, ipy, ipz = _inner_position(inner_type, inner_params, px + ocx, ocy, ocz)
+            lines.append(f"inner{i} = {_make_shape_call(inner_type, inner_params, ipx, ipy, ipz)}")
+            lines.append(f"all_shapes.append(inner{i})")
+        lines.append("")
+
+    lines += [
+        "result = Part.makeCompound(all_shapes) if len(all_shapes) > 1 else all_shapes[0]",
+        'part = doc.addObject("Part::Feature", "GeneratedModel")',
+        "part.Shape = result",
+        "doc.recompute()",
+        "",
+    ]
+
     if out_fcstd:
-        save_lines.append(f'doc.saveAs(r"{out_fcstd}")')
-        save_lines.append(f'print("FCStd:", r"{out_fcstd}")')
+        lines += [f'doc.saveAs(r"{out_fcstd}")', f'print("FCStd:", r"{out_fcstd}")']
     if out_step:
-        save_lines.append(f'shape.exportStep(r"{out_step}")')
-        save_lines.append(f'print("STEP:", r"{out_step}")')
+        lines += [f'result.exportStep(r"{out_step}")', f'print("STEP:", r"{out_step}")']
     if out_stl:
-        save_lines.append(f'shape.exportStl(r"{out_stl}")')
-        save_lines.append(f'print("STL:", r"{out_stl}")')
-    save_block = "\n".join(save_lines)
+        lines += [f'result.exportStl(r"{out_stl}")', f'print("STL:", r"{out_stl}")']
 
-    return f"""\
-import FreeCAD as App
-import Part
-
-doc = App.newDocument("GeneratedModel")
-
-{shape_code}
-
-part = doc.addObject("Part::Feature", "{label}")
-part.Shape = shape
-doc.recompute()
-
-{save_block}
-
-# GUI 모드일 때만 실행: ViewProvider 초기화 + 3D 뷰 맞춤
-try:
-    import FreeCADGui as Gui
-    Gui.ActiveDocument.ActiveView.viewIsometric()
-    Gui.SendMsgToActiveView("ViewFit")
-except Exception:
-    pass  # 헤드리스 모드에서는 Gui 모듈이 없으므로 무시
-
-print("Done.")
-"""
+    lines += [
+        "",
+        "try:",
+        "    import FreeCADGui as Gui",
+        "    Gui.ActiveDocument.ActiveView.viewIsometric()",
+        '    Gui.SendMsgToActiveView("ViewFit")',
+        "except Exception:",
+        "    pass",
+        "",
+        'print("Done.")',
+    ]
+    return "\n".join(lines)
 
 
 # ── GUI 콜백 ─────────────────────────────────────────────────────────────────
@@ -145,11 +180,9 @@ def browse_output_folder():
 
 
 def on_shape_changed(event=None):
-    """도형 종류에 따라 파라미터 행을 표시/숨김"""
     s = combo_shape.get()
     for widget in param_frame.winfo_children():
         widget.grid_remove()
-
     if s == "Box":
         lbl_p1.config(text="x (길이)")
         lbl_p2.config(text="y (너비)")
@@ -178,6 +211,47 @@ def on_shape_changed(event=None):
             w.grid()
 
 
+def on_inner_shape_changed(event=None):
+    s = combo_inner_shape.get()
+    for widget in inner_param_frame.winfo_children():
+        widget.grid_remove()
+    if s == "Box":
+        lbl_ip1.config(text="x (길이)")
+        lbl_ip2.config(text="y (너비)")
+        lbl_ip3.config(text="z (높이)")
+        for w in [lbl_ip1, entry_ip1, combo_iu1,
+                  lbl_ip2, entry_ip2, combo_iu2,
+                  lbl_ip3, entry_ip3, combo_iu3]:
+            w.grid()
+    elif s == "Cylinder":
+        lbl_ip1.config(text="반지름 (r)")
+        lbl_ip2.config(text="높이 (h)")
+        for w in [lbl_ip1, entry_ip1, combo_iu1,
+                  lbl_ip2, entry_ip2, combo_iu2]:
+            w.grid()
+    elif s == "Cone":
+        lbl_ip1.config(text="밑면 반지름")
+        lbl_ip2.config(text="윗면 반지름")
+        lbl_ip3.config(text="높이 (h)")
+        for w in [lbl_ip1, entry_ip1, combo_iu1,
+                  lbl_ip2, entry_ip2, combo_iu2,
+                  lbl_ip3, entry_ip3, combo_iu3]:
+            w.grid()
+    elif s == "Sphere":
+        lbl_ip1.config(text="반지름 (r)")
+        for w in [lbl_ip1, entry_ip1, combo_iu1]:
+            w.grid()
+
+
+def on_inner_toggle():
+    if var_inner.get():
+        inner_frame.grid(row=9, column=0, columnspan=3,
+                         padx=10, pady=4, sticky="ew")
+        on_inner_shape_changed()
+    else:
+        inner_frame.grid_remove()
+
+
 def get_param(entry, combo):
     v = float(entry.get())
     if v <= 0:
@@ -185,12 +259,45 @@ def get_param(entry, combo):
     return to_mm(v, combo.get())
 
 
+def get_inner_params():
+    """내부 도형 비활성화 시 (None, None), 활성화 시 (type, params) 반환."""
+    if not var_inner.get():
+        return None, None
+    inner_type = combo_inner_shape.get()
+    try:
+        if inner_type == "Box":
+            params = {
+                "length": get_param(entry_ip1, combo_iu1),
+                "width":  get_param(entry_ip2, combo_iu2),
+                "height": get_param(entry_ip3, combo_iu3),
+            }
+        elif inner_type == "Cylinder":
+            params = {
+                "radius": get_param(entry_ip1, combo_iu1),
+                "height": get_param(entry_ip2, combo_iu2),
+            }
+        elif inner_type == "Cone":
+            params = {
+                "radius1": get_param(entry_ip1, combo_iu1),
+                "radius2": get_param(entry_ip2, combo_iu2),
+                "height":  get_param(entry_ip3, combo_iu3),
+            }
+        elif inner_type == "Sphere":
+            params = {"radius": get_param(entry_ip1, combo_iu1)}
+        else:
+            raise ValueError("내부 도형을 선택해주세요.")
+        return inner_type, params
+    except ValueError as e:
+        raise ValueError(f"내부 도형 파라미터 오류: {e}")
+
+
 def generate_model():
     shape = combo_shape.get()
 
+    # ── 외부 도형 파라미터 ──
     try:
         if shape == "Box":
-            params = {
+            outer_params = {
                 "length": get_param(entry_p1, combo_u1),
                 "width":  get_param(entry_p2, combo_u2),
                 "height": get_param(entry_p3, combo_u3),
@@ -199,14 +306,14 @@ def generate_model():
                     f"y={entry_p2.get()} {combo_u2.get()}  "
                     f"z={entry_p3.get()} {combo_u3.get()}")
         elif shape == "Cylinder":
-            params = {
+            outer_params = {
                 "radius": get_param(entry_p1, combo_u1),
                 "height": get_param(entry_p2, combo_u2),
             }
             desc = (f"r={entry_p1.get()} {combo_u1.get()}  "
                     f"h={entry_p2.get()} {combo_u2.get()}")
         elif shape == "Cone":
-            params = {
+            outer_params = {
                 "radius1": get_param(entry_p1, combo_u1),
                 "radius2": get_param(entry_p2, combo_u2),
                 "height":  get_param(entry_p3, combo_u3),
@@ -215,7 +322,7 @@ def generate_model():
                     f"r2={entry_p2.get()} {combo_u2.get()}  "
                     f"h={entry_p3.get()} {combo_u3.get()}")
         elif shape == "Sphere":
-            params = {"radius": get_param(entry_p1, combo_u1)}
+            outer_params = {"radius": get_param(entry_p1, combo_u1)}
             desc = f"r={entry_p1.get()} {combo_u1.get()}"
         else:
             messagebox.showerror("오류", "도형을 선택해주세요.")
@@ -224,7 +331,27 @@ def generate_model():
         messagebox.showerror("입력 오류", f"파라미터 값을 확인해주세요.\n{e}")
         return
 
-    # 출력 폴더
+    # ── 개수 / 간격 ──
+    try:
+        count = int(spin_count.get())
+        if count < 1 or count > 20:
+            raise ValueError("개수는 1~20 사이여야 합니다.")
+        spacing_raw = entry_spacing.get().strip() or "0"
+        spacing = to_mm(float(spacing_raw), combo_spacing_unit.get())
+        if spacing < 0:
+            raise ValueError("간격은 0 이상이어야 합니다.")
+    except ValueError as e:
+        messagebox.showerror("입력 오류", f"개수/간격 값을 확인해주세요.\n{e}")
+        return
+
+    # ── 내부 도형 파라미터 ──
+    try:
+        inner_type, inner_params = get_inner_params()
+    except ValueError as e:
+        messagebox.showerror("입력 오류", str(e))
+        return
+
+    # ── 출력 폴더 ──
     out_dir = entry_output_dir.get().strip()
     if not out_dir:
         out_dir = os.path.join(os.path.expanduser("~"), "Documents")
@@ -239,7 +366,7 @@ def generate_model():
         messagebox.showerror("저장 형식 오류", "저장 형식을 하나 이상 선택해주세요.")
         return
 
-    # FreeCAD 실행 파일 탐색
+    # ── FreeCAD 실행 파일 탐색 ──
     custom_dir = entry_freecad_dir.get().strip() or None
     gui_path, cmd_path = find_freecad_executables(custom_dir)
 
@@ -251,9 +378,13 @@ def generate_model():
         )
         return
 
-    # 스크립트를 출력 폴더에 저장 (Popen 비동기 실행 시 삭제 타이밍 문제 방지)
+    # ── 스크립트 생성 ──
     script_path = os.path.join(out_dir, "_freecad_run.py")
-    script_content = make_freecad_script(shape, params, out_fcstd, out_step, out_stl)
+    script_content = make_freecad_script(
+        shape, outer_params, count, spacing,
+        inner_type, inner_params,
+        out_fcstd, out_step, out_stl,
+    )
     try:
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(script_content)
@@ -261,34 +392,27 @@ def generate_model():
         messagebox.showerror("파일 오류", f"스크립트 파일을 생성할 수 없습니다.\n{e}")
         return
 
+    count_desc  = f" ×{count}" if count > 1 else ""
+    inner_desc  = f"  / 내부: {inner_type}" if inner_type else ""
+    full_desc   = f"{desc}{count_desc}{inner_desc}"
+
     if gui_path:
-        # ── GUI 모드: FreeCAD.exe 로 스크립트 실행 ──────────────────────────
-        # FreeCAD.exe 가 스크립트를 읽어 실행하면서 ViewProvider 포함 생성,
-        # Gui.SendMsgToActiveView("ViewFit") 으로 3D 뷰에 도형이 바로 표시됨.
         try:
             subprocess.Popen([gui_path, script_path])
         except Exception as e:
             messagebox.showerror("실행 오류", f"FreeCAD 실행 실패\n{e}")
             return
-
         result_label.config(
-            text=f"[{shape}] FreeCAD 실행 중...\n{desc}\n\n"
-                 f"※ 파일 생성 완료 후 아래에 경로가 표시됩니다."
+            text=f"[{shape}]{count_desc} FreeCAD 실행 중...\n{full_desc}\n\n"
+                 "※ 파일 생성 완료 후 아래에 경로가 표시됩니다."
         )
-        # 비동기로 파일 생성 여부 확인 (FreeCAD 기동에 ~5초 소요)
-        root.after(6000, lambda: _check_saved(shape, desc, out_fcstd, out_step, out_stl))
-
+        root.after(6000, lambda: _check_saved(shape, full_desc, out_fcstd, out_step, out_stl))
     else:
-        # ── 헤드리스 모드: FreeCADCmd.exe 로 실행 (GUI 없음) ────────────────
         try:
-            result = subprocess.run(
+            subprocess.run(
                 [cmd_path, script_path],
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
+                check=True, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=120,
             )
         except subprocess.CalledProcessError as e:
             err = (e.stderr or e.stdout or str(e))[:800]
@@ -297,12 +421,10 @@ def generate_model():
         except Exception as e:
             messagebox.showerror("오류", str(e))
             return
-
-        _check_saved(shape, desc, out_fcstd, out_step, out_stl, show_popup=True)
+        _check_saved(shape, full_desc, out_fcstd, out_step, out_stl, show_popup=True)
 
 
 def _check_saved(shape, desc, out_fcstd, out_step, out_stl, show_popup=False):
-    """생성된 파일 목록을 확인하고 result_label 갱신. 미생성 시 재시도."""
     saved = []
     if out_fcstd and os.path.exists(out_fcstd):
         saved.append(f"FCStd : {out_fcstd}")
@@ -318,7 +440,6 @@ def _check_saved(shape, desc, out_fcstd, out_step, out_stl, show_popup=False):
         if show_popup:
             messagebox.showinfo("완료", f"{shape} 3D 도면 생성이 완료되었습니다.")
     else:
-        # 아직 FreeCAD가 파일을 저장 중일 수 있으므로 3초 후 재확인
         current = result_label.cget("text")
         if "재확인" not in current:
             result_label.config(
@@ -330,15 +451,15 @@ def _check_saved(shape, desc, out_fcstd, out_step, out_stl, show_popup=False):
 # ── GUI 구성 ──────────────────────────────────────────────────────────────────
 root = tk.Tk()
 root.title("3D 도면 자동 생성 프로그램")
-root.geometry("520x560")
-root.resizable(False, False)
+root.geometry("580x840")
+root.resizable(False, True)
 
 units = ["mm", "cm", "m"]
-PAD = {"padx": 8, "pady": 5}
+PAD = {"padx": 8, "pady": 4}
 
 # 제목
 tk.Label(root, text="3D 도면 자동 생성 프로그램",
-         font=("Arial", 14, "bold")).grid(row=0, column=0, columnspan=3, pady=12)
+         font=("Arial", 14, "bold")).grid(row=0, column=0, columnspan=3, pady=10)
 
 # ── 도형 선택 ──
 tk.Label(root, text="도형 선택").grid(row=1, column=0, sticky="e", **PAD)
@@ -349,11 +470,12 @@ combo_shape.set("Box")
 combo_shape.bind("<<ComboboxSelected>>", on_shape_changed)
 
 ttk.Separator(root, orient="horizontal").grid(
-    row=2, column=0, columnspan=3, sticky="ew", padx=10, pady=4)
+    row=2, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
 
 # ── 파라미터 프레임 ──
 param_frame = tk.Frame(root)
 param_frame.grid(row=3, column=0, columnspan=3)
+
 
 def make_param_row(frame, row, default_label):
     lbl = tk.Label(frame, text=default_label, width=14, anchor="e")
@@ -365,17 +487,77 @@ def make_param_row(frame, row, default_label):
     cmb.set("mm")
     return lbl, ent, cmb
 
+
 lbl_p1, entry_p1, combo_u1 = make_param_row(param_frame, 0, "x (길이)")
 lbl_p2, entry_p2, combo_u2 = make_param_row(param_frame, 1, "y (너비)")
 lbl_p3, entry_p3, combo_u3 = make_param_row(param_frame, 2, "z (높이)")
 
 ttk.Separator(root, orient="horizontal").grid(
-    row=4, column=0, columnspan=3, sticky="ew", padx=10, pady=4)
+    row=4, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
+
+# ── 생성 개수 ──
+tk.Label(root, text="생성 개수").grid(row=5, column=0, sticky="e", **PAD)
+count_frame = tk.Frame(root)
+count_frame.grid(row=5, column=1, columnspan=2, sticky="w")
+spin_count = ttk.Spinbox(count_frame, from_=1, to=20, width=5)
+spin_count.set("1")
+spin_count.pack(side="left")
+tk.Label(count_frame, text="개  (최대 20개)",
+         fg="gray", font=("Arial", 9)).pack(side="left", padx=6)
+
+# ── 도형 간격 ──
+tk.Label(root, text="도형 간격").grid(row=6, column=0, sticky="e", **PAD)
+spacing_frame = tk.Frame(root)
+spacing_frame.grid(row=6, column=1, columnspan=2, sticky="w")
+entry_spacing = tk.Entry(spacing_frame, width=10)
+entry_spacing.insert(0, "0")
+entry_spacing.pack(side="left")
+combo_spacing_unit = ttk.Combobox(spacing_frame, values=units, width=6, state="readonly")
+combo_spacing_unit.set("mm")
+combo_spacing_unit.pack(side="left", padx=4)
+tk.Label(spacing_frame, text="(인접 도형 사이 빈 공간)",
+         fg="gray", font=("Arial", 9)).pack(side="left")
+
+ttk.Separator(root, orient="horizontal").grid(
+    row=7, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
+
+# ── 내부 도형 ──
+var_inner = tk.BooleanVar(value=False)
+tk.Checkbutton(
+    root,
+    text="내부 도형 추가  (각 외부 도형의 중심에 배치)",
+    variable=var_inner,
+    command=on_inner_toggle,
+    font=("Arial", 10),
+).grid(row=8, column=0, columnspan=3, sticky="w", padx=12, pady=2)
+
+# inner_frame — on_inner_toggle 에 의해 row=9 에 표시/숨김
+inner_frame = tk.LabelFrame(root, text="내부 도형 설정", padx=6, pady=4)
+
+tk.Label(inner_frame, text="도형 종류", width=12, anchor="e").grid(
+    row=0, column=0, **PAD)
+combo_inner_shape = ttk.Combobox(
+    inner_frame, values=["Box", "Cylinder", "Cone", "Sphere"],
+    width=14, state="readonly")
+combo_inner_shape.grid(row=0, column=1, columnspan=2, sticky="w", **PAD)
+combo_inner_shape.set("Sphere")
+combo_inner_shape.bind("<<ComboboxSelected>>", on_inner_shape_changed)
+
+inner_param_frame = tk.Frame(inner_frame)
+inner_param_frame.grid(row=1, column=0, columnspan=3)
+
+lbl_ip1, entry_ip1, combo_iu1 = make_param_row(inner_param_frame, 0, "반지름 (r)")
+lbl_ip2, entry_ip2, combo_iu2 = make_param_row(inner_param_frame, 1, "높이 (h)")
+lbl_ip3, entry_ip3, combo_iu3 = make_param_row(inner_param_frame, 2, "z (높이)")
+
+# row 10 은 inner_frame 이 없을 때 separator 역할 (inner 가 없으면 row 9 가 비어있음)
+ttk.Separator(root, orient="horizontal").grid(
+    row=10, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
 
 # ── 저장 형식 ──
-tk.Label(root, text="저장 형식").grid(row=5, column=0, sticky="e", **PAD)
+tk.Label(root, text="저장 형식").grid(row=11, column=0, sticky="e", **PAD)
 fmt_frame = tk.Frame(root)
-fmt_frame.grid(row=5, column=1, columnspan=2, sticky="w")
+fmt_frame.grid(row=11, column=1, columnspan=2, sticky="w")
 var_fcstd = tk.BooleanVar(value=True)
 var_step  = tk.BooleanVar(value=True)
 var_stl   = tk.BooleanVar(value=True)
@@ -384,24 +566,24 @@ tk.Checkbutton(fmt_frame, text="STEP",  variable=var_step).pack(side="left", pad
 tk.Checkbutton(fmt_frame, text="STL",   variable=var_stl).pack(side="left", padx=4)
 
 # ── 출력 폴더 ──
-tk.Label(root, text="출력 폴더").grid(row=6, column=0, sticky="e", **PAD)
+tk.Label(root, text="출력 폴더").grid(row=12, column=0, sticky="e", **PAD)
 entry_output_dir = tk.Entry(root, width=30)
-entry_output_dir.grid(row=6, column=1, sticky="ew", **PAD)
+entry_output_dir.grid(row=12, column=1, sticky="ew", **PAD)
 entry_output_dir.insert(0, os.path.join(os.path.expanduser("~"), "Documents"))
 tk.Button(root, text="찾아보기", command=browse_output_folder, width=10).grid(
-    row=6, column=2, **PAD)
+    row=12, column=2, **PAD)
 
 ttk.Separator(root, orient="horizontal").grid(
-    row=7, column=0, columnspan=3, sticky="ew", padx=10, pady=4)
+    row=13, column=0, columnspan=3, sticky="ew", padx=10, pady=3)
 
 # ── FreeCAD 설치 폴더 ──
-tk.Label(root, text="FreeCAD\n실행 폴더").grid(row=8, column=0, sticky="e", **PAD)
+tk.Label(root, text="FreeCAD\n실행 폴더").grid(row=14, column=0, sticky="e", **PAD)
 entry_freecad_dir = tk.Entry(root, width=30)
-entry_freecad_dir.grid(row=8, column=1, sticky="ew", **PAD)
+entry_freecad_dir.grid(row=14, column=1, sticky="ew", **PAD)
 tk.Button(root, text="찾아보기", command=browse_freecad_folder, width=10).grid(
-    row=8, column=2, **PAD)
+    row=14, column=2, **PAD)
 tk.Label(root, text="※ 비워두면 자동 탐색 (Program Files 등)",
-         font=("Arial", 8), fg="gray").grid(row=9, column=0, columnspan=3)
+         font=("Arial", 8), fg="gray").grid(row=15, column=0, columnspan=3)
 
 # ── 생성 버튼 ──
 tk.Button(
@@ -414,12 +596,12 @@ tk.Button(
     font=("Arial", 11, "bold"),
     relief="raised",
     cursor="hand2",
-).grid(row=10, column=0, columnspan=3, pady=16)
+).grid(row=16, column=0, columnspan=3, pady=14)
 
 # ── 결과 표시 ──
 result_label = tk.Label(root, text="", justify="left", fg="#1565C0",
-                         font=("Arial", 9), wraplength=480)
-result_label.grid(row=11, column=0, columnspan=3, padx=10, pady=4)
+                         font=("Arial", 9), wraplength=540)
+result_label.grid(row=17, column=0, columnspan=3, padx=10, pady=4)
 
 # 초기 파라미터 표시
 on_shape_changed()
